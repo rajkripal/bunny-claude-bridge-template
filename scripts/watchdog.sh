@@ -26,8 +26,13 @@ REASON=""
 if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
     REASON="tmux session missing"
 else
-    CLAUDE_PID=$(tmux list-panes -t "$SESSION_NAME" -F '#{pane_pid}' 2>/dev/null)
-    if [ -z "$CLAUDE_PID" ] || ! ps -p "$CLAUDE_PID" > /dev/null 2>&1; then
+    # pane_pid is the shell (zsh) that launched claude, not claude itself.
+    # When claude exits cleanly, zsh stays alive and pane_pid appears healthy
+    # while the assistant is actually dead. Detect the real claude process via
+    # its --name flag (unique per bridge session). pgrep -f doesn't reliably
+    # see the claude binary on macOS, so scan ps output directly.
+    CLAUDE_PID=$(ps -Ao pid,command= | awk -v n="--name $SESSION_NAME" '$0 ~ n && !/awk/ {print $1; exit}')
+    if [ -z "$CLAUDE_PID" ]; then
         REASON="claude process missing"
     elif ! pgrep -f "claude-plugins-official/telegram.*start" > /dev/null 2>&1; then
         # Grace period: MCP child may not have spawned yet. Only fail if
