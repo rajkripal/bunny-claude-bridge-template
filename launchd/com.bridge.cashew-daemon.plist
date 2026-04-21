@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Optional: keeps the cashew warm-daemon alive. Only useful if you use cashew
+  with a long-running server. Replace /PATH/TO/CASHEW with your CASHEW_HOME
+  and /PATH/TO/YOUR/LOGS with your BRIDGE_LOG_DIR.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.bridge.cashew-daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/PATH/TO/CASHEW/cashew_cli.py</string>
+        <string>serve</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/PATH/TO/CASHEW</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/PATH/TO/YOUR/LOGS/cashew-daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/PATH/TO/YOUR/LOGS/cashew-daemon-err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>KMP_DUPLICATE_LIB_OK</key>
+        <string>TRUE</string>
+    </dict>
+</dict>
+</plist>

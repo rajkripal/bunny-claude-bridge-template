@@ -1,0 +1,22 @@
+# Template cron jobs. Replace ${BRIDGE_DIR} and ${LOG_DIR} with absolutes,
+# or set them above in the crontab environment block.
+# Install: crontab cron/crontab.txt
+
+SHELL=/bin/bash
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+BRIDGE_DIR=/path/to/your/bridge
+LOG_DIR=/path/to/your/bridge-logs
+
+# === BRAIN MAINTENANCE (requires a cashew-style memory backend; remove otherwise) ===
+0 */2 * * * bash $BRIDGE_DIR/scripts/run-job.sh session-extract
+0 5,17 * * * bash $BRIDGE_DIR/scripts/run-job.sh think-cycle
+0 */6 * * * bash $BRIDGE_DIR/scripts/run-job.sh sleep-cycle
+0 */6 * * * bash $BRIDGE_DIR/scripts/run-job.sh db-backup
+0 8 * * * bash $BRIDGE_DIR/scripts/run-job.sh health-check --notify
+0 8 * * * bash $BRIDGE_DIR/scripts/run-job.sh brain-metrics
+0 6 * * * bash $BRIDGE_DIR/scripts/run-job.sh declassify
+
+# === PRODUCTIVITY ===
+0 12 * * * bash $BRIDGE_DIR/scripts/run-job.sh todo-squash
+0 9,21 * * * bash $BRIDGE_DIR/scripts/run-job.sh open-questions --notify
+30 */3 * * * bash $BRIDGE_DIR/scripts/run-job.sh round-trip

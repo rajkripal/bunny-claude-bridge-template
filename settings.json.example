@@ -1,0 +1,60 @@
+{
+  "_comment": "Copy this to .claude/settings.json inside your checkout. Replace ${BRIDGE_HOME} with the absolute path to your checkout (Claude Code may not expand env vars in this file).",
+  "hooks": {
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${BRIDGE_HOME}/hooks/pre_compact.py"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${BRIDGE_HOME}/hooks/post_compact.py"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${BRIDGE_HOME}/hooks/init.py"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${BRIDGE_HOME}/hooks/user_prompt_submit.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${BRIDGE_HOME}/hooks/stop.py"
+          }
+        ]
+      }
+    ]
+  }
+}
