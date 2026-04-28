@@ -35,8 +35,9 @@ else
     if [ -z "$CLAUDE_PID" ]; then
         REASON="claude process missing"
     elif ! pgrep -f "claude-plugins-official/telegram.*start" > /dev/null 2>&1; then
-        # Grace period: MCP child may not have spawned yet. Only fail if
-        # claude has been running for >90s.
+        # Grace period: MCP child may not have spawned yet. On a cold Mac
+        # boot, MCP can take longer than 90s to register, so use 300s.
+        # Real MCP deaths observed in practice all had claude up >400s.
         ETIME=$(ps -o etime= -p "$CLAUDE_PID" 2>/dev/null | awk '{print $1}')
         ETIME_SEC=$(echo "$ETIME" | awk -F'[-:]' '{
             if (NF==4) print $1*86400 + $2*3600 + $3*60 + $4;
@@ -44,7 +45,7 @@ else
             else if (NF==2) print $1*60 + $2;
             else print 0
         }')
-        if [ "${ETIME_SEC:-0}" -gt 90 ]; then
+        if [ "${ETIME_SEC:-0}" -gt 300 ]; then
             REASON="telegram MCP subprocess missing (claude up ${ETIME_SEC}s)"
         fi
     fi

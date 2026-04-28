@@ -11,7 +11,7 @@ PASS=0; FAIL=0
 
 # Derive the health-check block from watchdog.sh itself, stripping the
 # restart path (everything from the "restarting" echo onward).
-WATCHDOG=/Users/bunny/bunny-claude-bridge/scripts/watchdog.sh
+WATCHDOG="$(cd "$(dirname "$0")" && pwd)/watchdog.sh"
 TMP=$(mktemp /tmp/watchdog-health-XXXX.sh)
 # Strip the original empty-REASON exit-0 block AND everything from the
 # restart echo onward — we want to reach our appended HEALTH_OK/FAIL logic
