@@ -30,7 +30,18 @@ fi
 
 MESSAGE="${MESSAGE:0:4090}"
 
-curl -s "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-    -d "chat_id=${TELEGRAM_CHAT_ID}" \
-    -d "text=${MESSAGE}" \
-    > /dev/null 2>&1
+# Send as plain text. Markdown / MarkdownV2 parse modes silently reject
+# messages with unbalanced *, _, ( or unescaped $ — and the failure is
+# invisible if curl errors are sent to /dev/null. Plain text is more
+# robust for cron-generated output.
+RESPONSE=$(curl -s --max-time 30 "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+    --data-urlencode "text=${MESSAGE}" 2>&1)
+
+# Surface failures. Caller (run-job.sh) appends our stdout to the job log,
+# so a non-ok response will land there for postmortem instead of vanishing.
+if ! echo "$RESPONSE" | grep -q '"ok":true'; then
+    echo "[telegram-notify] SEND FAILED: $RESPONSE" >&2
+    exit 2
+fi
+echo "[telegram-notify] sent ok ($(echo -n "$MESSAGE" | wc -c) chars)"

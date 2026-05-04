@@ -1,7 +1,7 @@
 # claude-bridge template
 
 A template for running a persistent, always-on Claude Code assistant connected
-to Telegram and/or Discord, with optional [cashew](https://github.com/) brain
+to Telegram and/or Discord, with optional [cashew](https://github.com/rajkripal/cashew) brain
 memory and a library of scheduled jobs (launchd on macOS, cron elsewhere).
 
 This is the sanitized skeleton of a working setup. Clone it, fill in your

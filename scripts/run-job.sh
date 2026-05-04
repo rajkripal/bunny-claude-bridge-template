@@ -51,7 +51,18 @@ fi
 
 # Run claude -p with a hard 10-minute timeout. A stuck `claude -p` otherwise
 # pins a PID indefinitely and blocks the next scheduled run's assumptions.
-OUTPUT=$(cd "$BRIDGE_DIR" && perl -e 'alarm shift; exec @ARGV' 600 claude -p "$PROMPT" --permission-mode bypassPermissions --model "$MODEL" 2>&1) || true
+#
+# --strict-mcp-config + empty MCP config: cron jobs invoke claude -p
+# concurrently with the main interactive session. Without these flags, the
+# child would inherit the telegram (or discord) MCP plugin and race the main
+# session for the bot's long-poll lock, killing the main session's MCP.
+EMPTY_MCP="$SELF_DIR/empty-mcp.json"
+[ -f "$EMPTY_MCP" ] || echo '{"mcpServers":{}}' > "$EMPTY_MCP"
+OUTPUT=$(cd "$BRIDGE_DIR" && perl -e 'alarm shift; exec @ARGV' 600 \
+    claude -p "$PROMPT" \
+    --permission-mode bypassPermissions \
+    --model "$MODEL" \
+    --strict-mcp-config --mcp-config "$EMPTY_MCP" 2>&1) || true
 RC=$?
 if [ "$RC" = "142" ]; then
     OUTPUT="${OUTPUT}

@@ -4,3 +4,5 @@ __pycache__/
 *.log
 .pytest_cache/
 logs/
+.claude/settings.json
+.claude/scheduled_tasks.lock
