@@ -37,6 +37,9 @@ mkdir -p "$LOG_DIR"
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 export KMP_DUPLICATE_LIB_OK="TRUE"
+# Signal cron context to hooks/stop.py so it doesn't ship cron output
+# (thinking + text) to Telegram via the post-compaction fallback.
+export BUNNY_CRON_JOB="1"
 
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 echo "[$TIMESTAMP] Starting job: $JOB_NAME" >> "$LOG_DIR/$JOB_NAME.log"
