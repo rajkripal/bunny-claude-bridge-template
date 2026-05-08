@@ -90,10 +90,9 @@ def _message_text(msg: dict) -> str:
         btype = block.get("type")
         if btype == "text":
             parts.append(block.get("text", ""))
-        elif btype == "thinking":
-            thought = block.get("thinking", "")
-            if thought:
-                parts.append(f"thinking: {thought}")
+        # Thinking blocks are intentionally excluded. They are the
+        # assistant's internal reasoning trace, not a message to the user.
+        # Including them in the Telegram fallback produces noisy output.
     return "\n\n".join(p for p in parts if p)
 
 
@@ -267,6 +266,16 @@ def _send_message(
 
 
 def main() -> int:
+    # Cron jobs (run-job.sh) export BUNNY_CRON_JOB=1 before invoking
+    # claude -p. Their prompts have no Telegram channel tag, so the
+    # post-compaction fallback further down would otherwise treat the
+    # cron's last-known chat_id as the destination and ship the cron
+    # output (thinking + text) to the user. Skip the hook entirely
+    # for cron contexts.
+    if os.environ.get("BUNNY_CRON_JOB"):
+        _log("skip", reason="cron_job_env")
+        return 0
+
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except json.JSONDecodeError:
