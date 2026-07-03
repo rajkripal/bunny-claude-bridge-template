@@ -13,6 +13,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tg_ledger  # noqa: E402
+
 CASHEW_DIR = Path(os.environ.get("CASHEW_HOME", str(Path.home() / "cashew")))
 CASHEW_SCRIPT = CASHEW_DIR / "scripts" / "cashew_context.py"
 
@@ -44,24 +47,47 @@ def query_brain(hints: str) -> str:
         return ""
 
 
+def telegram_etiquette_section() -> str:
+    """Unanswered inbound messages + the reply-tool reminder.
+
+    Compaction is the #1 moment replies get dropped: the channel tags are
+    gone from context and the reply tool's schema is unloaded. Surface both
+    facts explicitly so the very next turn re-acks instead of going silent.
+    """
+    lines = [
+        "## Telegram Etiquette (post-compaction)",
+        "The telegram reply tool schema is UNLOADED after compaction. Before"
+        " replying, load it: ToolSearch"
+        ' "select:mcp__plugin_telegram_telegram__reply". Replies go through'
+        " the reply tool, never transcript text.",
+    ]
+    try:
+        unanswered = tg_ledger.unanswered_entries()
+    except Exception as e:
+        lines.append(f"(unanswered-message check failed: {e})")
+        return "\n".join(lines)
+    if unanswered:
+        lines.append("Unanswered messages — ack or answer these NOW:")
+        for _, entry, age in unanswered:
+            preview = (entry.get("content") or "<attachment>").replace("\n", " ")[:100]
+            lines.append(
+                f"- #{entry.get('message_id')} from {entry.get('user', '?')}"
+                f" ({int(age // 60)}m ago, chat {entry.get('chat_id')}): {preview}"
+            )
+    else:
+        lines.append("No unanswered telegram messages right now.")
+    return "\n".join(lines)
+
+
 def main():
     identity = query_brain(IDENTITY_HINTS)
     recent = query_brain(RECENT_HINTS)
 
-    output_parts = []
+    output_parts = [telegram_etiquette_section()]
     if identity:
         output_parts.append(f"## Identity Context (from brain)\n{identity}")
     if recent:
         output_parts.append(f"## Recent Context (from brain)\n{recent}")
-
-    output_parts.append(
-        "## Telegram reminder\n"
-        "If the conversation you're resuming came in via Telegram (a <channel "
-        "source=\"plugin:telegram:telegram\"> block), your transcript text does "
-        "NOT reach the user. Reply via the mcp__plugin_telegram_telegram__reply "
-        "tool, passing chat_id from the inbound block. Post-compaction it's easy "
-        "to forget — don't."
-    )
 
     if output_parts:
         print("\n\n".join(output_parts))

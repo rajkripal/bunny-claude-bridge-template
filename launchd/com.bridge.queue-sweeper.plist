@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Queue sweeper. Runs scripts/queue-sweeper.py every 120s: acks answered inbound
+  messages, nudges the session about unanswered ones, retries the outbox.
+  Edit the /PATH/TO/... paths to absolutes before loading.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.bridge.queue-sweeper</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/PATH/TO/YOUR/BRIDGE/scripts/queue-sweeper.py</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>120</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/PATH/TO/YOUR/LOGS/queue-sweeper-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/PATH/TO/YOUR/LOGS/queue-sweeper-launchd-err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

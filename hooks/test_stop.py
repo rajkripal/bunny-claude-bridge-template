@@ -180,5 +180,130 @@ class StopHookTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
 
 
+class LedgerAndOutboxTests(unittest.TestCase):
+    """New behaviors: reply_send ledger events, error-aware skip, meta-text
+    filter, and outbox fallback on send failure."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.sink = self.root / "sends.jsonl"
+        self.log = self.root / "delivery.log"
+        self.channel = self.root / "telegram"
+        self.env = {
+            **os.environ,
+            "STOP_HOOK_TEST_SINK": str(self.sink),
+            "STOP_HOOK_DELIVERY_LOG": str(self.log),
+            "TG_CHANNEL_DIR": str(self.channel),
+            "TELEGRAM_BOT_TOKEN": "T",
+        }
+        self.env.pop("STOP_HOOK_TEST_FAIL", None)
+        self.env.pop("BUNNY_CRON_JOB", None)
+
+    def run_hook_env(self, transcript: list[dict]) -> int:
+        path = self.root / "transcript.jsonl"
+        path.write_text(_jsonl(transcript))
+        result = subprocess.run(
+            [sys.executable, str(HOOK)],
+            input=json.dumps({"transcript_path": str(path)}),
+            text=True, capture_output=True, timeout=15, env=self.env,
+        )
+        return result.returncode
+
+    def sent(self) -> list[dict]:
+        if not self.sink.exists():
+            return []
+        return [json.loads(l) for l in self.sink.read_text().splitlines() if l.strip()]
+
+    def log_events(self, event: str) -> list[dict]:
+        if not self.log.exists():
+            return []
+        recs = [json.loads(l) for l in self.log.read_text().splitlines()]
+        return [r for r in recs if r.get("event") == event]
+
+    def _reply_tool_use(self, tid: str = "tu1", chat_id: str = "123") -> dict:
+        return {
+            "type": "tool_use", "id": tid, "input": {"chat_id": chat_id, "text": "hi"},
+            "name": "mcp__plugin_telegram_telegram__reply",
+        }
+
+    def _tool_result(self, tid: str, *, is_error: bool = False) -> dict:
+        return {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tid, "is_error": is_error,
+             "content": "err" if is_error else "sent"},
+        ]}}
+
+    def test_successful_reply_logged_as_reply_send(self):
+        code = self.run_hook_env([
+            _user(CHANNEL_MSG),
+            {"type": "assistant", "timestamp": "2026-07-02T08:00:00.000Z",
+             "message": {"role": "assistant", "content": [self._reply_tool_use()]}},
+            self._tool_result("tu1"),
+            _assistant([_text("done")]),
+        ])
+        self.assertEqual(code, 0)
+        events = self.log_events("reply_send")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["chat_id"], "123")
+        self.assertEqual(events[0]["tool_use_id"], "tu1")
+        # Epoch comes from the transcript timestamp, not hook runtime.
+        from datetime import datetime, timezone
+        expected = datetime(2026, 7, 2, 8, 0, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(events[0]["sent_at_epoch"], expected)
+        # And the hook skipped its own delivery (reply tool succeeded).
+        self.assertEqual(self.sent(), [])
+
+    def test_errored_reply_tool_does_not_skip_delivery(self):
+        code = self.run_hook_env([
+            _user(CHANNEL_MSG),
+            {"type": "assistant", "message": {"role": "assistant", "content": [
+                self._reply_tool_use("tu9"),
+            ]}},
+            self._tool_result("tu9", is_error=True),
+            _assistant([_text("the actual answer")]),
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.log_events("reply_send"), [])
+        sent = self.sent()
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["text"], "the actual answer")
+
+    def test_reply_send_deduped_across_runs(self):
+        transcript = [
+            _user(CHANNEL_MSG),
+            {"type": "assistant", "timestamp": "2026-07-02T08:00:00.000Z",
+             "message": {"role": "assistant", "content": [self._reply_tool_use()]}},
+            self._tool_result("tu1"),
+            _assistant([_text("done")]),
+        ]
+        self.run_hook_env(transcript)
+        self.run_hook_env(transcript)
+        self.assertEqual(len(self.log_events("reply_send")), 1)
+
+    def test_meta_text_not_shipped(self):
+        code = self.run_hook_env([
+            _user(CHANNEL_MSG),
+            _assistant([_text("No response requested.")]),
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.sent(), [])
+        skips = self.log_events("skip")
+        self.assertEqual(len(skips), 1)
+        self.assertEqual(skips[0]["reason"], "meta_text")
+
+    def test_send_failure_queues_outbox_and_exits_zero(self):
+        self.env["STOP_HOOK_TEST_FAIL"] = "1"
+        code = self.run_hook_env([
+            _user(CHANNEL_MSG),
+            _assistant([_text("important answer")]),
+        ])
+        self.assertEqual(code, 0)
+        outbox = list((self.channel / "outbox").glob("*.json"))
+        self.assertEqual(len(outbox), 1)
+        entry = json.loads(outbox[0].read_text())
+        self.assertEqual(entry["chat_id"], "123")
+        self.assertEqual(entry["text"], "important answer")
+        self.assertEqual(entry["reply_to"], "42")
+
+
 if __name__ == "__main__":
     unittest.main()

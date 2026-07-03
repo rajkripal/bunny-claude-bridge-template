@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Mark inbound telegram queue entries as acked-without-reply (phase 3).
+
+Usage: tg-ack <message_id> [<message_id> ...]
+
+Escape hatch for the queue-sweeper: when a message genuinely warrants no
+reply ("ok", a sticker), acking it here stops the nudge escalation without
+sending anything to the chat.
+"""
+
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+import tg_ledger  # noqa: E402
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print(__doc__.strip())
+        return 1
+    wanted = set(argv[1:])
+    hit = 0
+    for path, entry in tg_ledger.queue_entries():
+        if str(entry.get("message_id")) not in wanted:
+            continue
+        if str(entry.get("phase", "1")) != "1":
+            print(f"#{entry.get('message_id')}: already phase {entry.get('phase')}")
+            continue
+        entry["phase"] = "3"
+        entry["acked_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        if tg_ledger.rewrite_entry(path, entry):
+            hit += 1
+            print(f"#{entry.get('message_id')}: acked (no reply needed)")
+    missing = len(wanted) - hit
+    if missing > 0:
+        print(f"note: {missing} id(s) not found in phase-1 queue entries")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
