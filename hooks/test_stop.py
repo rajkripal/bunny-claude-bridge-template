@@ -48,9 +48,11 @@ def run_hook(transcript: list[dict], *, token: str | None = "T", sink: str | Non
         **os.environ,
         "STOP_HOOK_TEST_SINK": sink,
         "STOP_HOOK_DELIVERY_LOG": log_f.name,
+        "STOP_HOOK_FLUSH_TIMEOUT": "0.3",  # short event-wait ceiling for tests
     }
     if token is None:
         env.pop("TELEGRAM_BOT_TOKEN", None)
+        # Point token path to a non-existent file so the hook can't find one.
         env["HOME"] = tempfile.mkdtemp()
     else:
         env["TELEGRAM_BOT_TOKEN"] = token
@@ -67,7 +69,7 @@ def run_hook(transcript: list[dict], *, token: str | None = "T", sink: str | Non
     return result.returncode, result.stderr, sent
 
 
-CHANNEL_MSG = '<channel source="plugin:telegram:telegram" chat_id="123" message_id="42">hi</channel>'
+CHANNEL_MSG = '<channel source="plugin:telegram:telegram" chat_id="123" message_id="42">hi there</channel>'
 
 
 class StopHookTests(unittest.TestCase):
@@ -120,6 +122,9 @@ class StopHookTests(unittest.TestCase):
         self.assertEqual(sent, [])
 
     def test_concatenates_all_tail_assistant_text(self):
+        # Stop fires once at turn-end, not between tool calls. A turn can
+        # interleave text with tool use; all text blocks must ship, otherwise
+        # the user sees only the tail while full reasoning was in the terminal.
         code, _, sent = run_hook([
             _user(CHANNEL_MSG),
             _assistant([_text("part one")]),
@@ -129,6 +134,43 @@ class StopHookTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["text"], "part one\n\npart two")
+
+    def test_ships_narration_and_conclusion_incident_shape(self):
+        # The 2026-07-04 shape: "let me do X:" narration lives in messages that
+        # ALSO carry a tool_use, followed by a text-only conclusion. the user wants
+        # the narration (to follow the thought process) AND the conclusion; both
+        # must ship, in order, and the delivery must NOT truncate at the last
+        # pre-command line.
+        code, _, sent = run_hook([
+            _user(CHANNEL_MSG),
+            _assistant([_text("let me inspect first:"), _tool_use("Bash")]),
+            _assistant([_text("main is an ancestor, advancing then push:"), _tool_use("Bash")]),
+            _assistant([_text("confirm merged, then force-delete safely:"), _tool_use("Bash")]),
+            _assistant([_text("Done. We are on a clean main now.")]),
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(
+            sent[0]["text"],
+            "let me inspect first:\n\n"
+            "main is an ancestor, advancing then push:\n\n"
+            "confirm merged, then force-delete safely:\n\n"
+            "Done. We are on a clean main now.",
+        )
+
+    def test_ships_narration_even_when_turn_ends_on_a_command(self):
+        # No text-only conclusion (turn ended mid-action, no concluding summary
+        # flushed within the wait). The event-wait times out and we still ship
+        # the narration text we have rather than nothing — the narration is
+        # wanted. (Behaviorally I should conclude with text; this is the floor.)
+        code, _, sent = run_hook([
+            _user(CHANNEL_MSG),
+            _assistant([_text("confirming merge, then force-delete safely:"),
+                        _tool_use("Bash")]),
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["text"], "confirming merge, then force-delete safely:")
 
     def test_string_content_user_message(self):
         code, _, sent = run_hook([
@@ -148,13 +190,14 @@ class StopHookTests(unittest.TestCase):
         self.assertEqual(sent, [])
 
     def test_chunks_long_text(self):
-        long = ("word " * 1200).strip()
+        long = ("word " * 1200).strip()  # ~6000 chars
         code, _, sent = run_hook([
             _user(CHANNEL_MSG),
             _assistant([_text(long)]),
         ])
         self.assertEqual(code, 0)
         self.assertGreaterEqual(len(sent), 2)
+        # reply_to only on first chunk
         self.assertIn("reply_parameters", sent[0])
         self.assertNotIn("reply_parameters", sent[1])
         for s in sent:
@@ -195,6 +238,7 @@ class LedgerAndOutboxTests(unittest.TestCase):
             "STOP_HOOK_DELIVERY_LOG": str(self.log),
             "TG_CHANNEL_DIR": str(self.channel),
             "TELEGRAM_BOT_TOKEN": "T",
+            "STOP_HOOK_FLUSH_TIMEOUT": "0.3",
         }
         self.env.pop("STOP_HOOK_TEST_FAIL", None)
         self.env.pop("BUNNY_CRON_JOB", None)

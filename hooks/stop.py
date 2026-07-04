@@ -34,6 +34,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tg_ledger  # noqa: E402
 
 TELEGRAM_REPLY_TOOL = "mcp__plugin_telegram_telegram__reply"
+# Safety ceiling for the event-driven wait on the concluding text block to
+# flush. This is a MAX bound, not a delay: the wait wakes the instant the
+# transcript is written (kqueue file-write event). Override low in tests.
+try:
+    _FLUSH_TIMEOUT = max(0.05, float(os.environ.get("STOP_HOOK_FLUSH_TIMEOUT", "8")))
+except ValueError:
+    _FLUSH_TIMEOUT = 8.0
 TELEGRAM_CHANNEL_RE = re.compile(
     r'<channel\s+source="plugin:telegram:[^"]*"(?P<attrs>[^>]*)>',
     re.IGNORECASE,
@@ -45,7 +52,8 @@ _log = tg_ledger.log_event
 
 # Harness meta-phrases the assistant emits to satisfy "produce visible output"
 # when there is genuinely nothing to say (system notifications, tool loads).
-# Shipping these to Telegram reads as noise.
+# Shipping these to Telegram reads as noise — a 22-byte "No response
+# requested." reached the user on 2026-07-02.
 META_TEXT_RE = re.compile(
     r"^(no response (requested|needed)\.?|tool loaded\.?|not applicable\b[^\n]*)$",
     re.IGNORECASE,
@@ -67,6 +75,37 @@ def _read_transcript(path: Path) -> list[dict]:
     return messages
 
 
+def _wait_file_write(path: Path, timeout: float) -> bool:
+    """Block until `path` is next written, or `timeout` elapses. Event-driven
+    via kqueue (macOS/BSD) — wakes the instant the transcript changes, no
+    polling, no fixed delay. Returns True if a write fired, False on timeout or
+    on a platform without kqueue (caller then does one final read and stops)."""
+    if timeout <= 0:
+        return False
+    try:
+        import select
+        if not hasattr(select, "kqueue"):
+            return False
+        fd = os.open(str(path), os.O_RDONLY)
+    except (OSError, ImportError):
+        return False
+    try:
+        kq = select.kqueue()
+        ev = select.kevent(
+            fd,
+            filter=select.KQ_FILTER_VNODE,
+            flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+            fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND | select.KQ_NOTE_DELETE,
+        )
+        triggered = kq.control([ev], 1, timeout)
+        kq.close()
+        return bool(triggered)
+    except (OSError, AttributeError):
+        return False
+    finally:
+        os.close(fd)
+
+
 def _message_text(msg: dict) -> str:
     m = msg.get("message") or {}
     content = m.get("content")
@@ -81,9 +120,10 @@ def _message_text(msg: dict) -> str:
         btype = block.get("type")
         if btype == "text":
             parts.append(block.get("text", ""))
-        # Thinking blocks are intentionally excluded. They surface the
-        # assistant's internal reasoning trace, not a message to the user.
-        # The Stop-hook fallback ships only the user-facing text.
+        # Thinking blocks are intentionally excluded. They surface the assistant's
+        # internal reasoning ("💭 Let me run the script...") which the user
+        # reads as verbose Telegram spam. The Stop-hook fallback ships
+        # only the user-facing text the assistant produced.
     return "\n\n".join(p for p in parts if p)
 
 
@@ -97,6 +137,13 @@ def _tool_uses(msg: dict) -> list[str]:
         if isinstance(block, dict) and block.get("type") == "tool_use":
             names.append(block.get("name", ""))
     return names
+
+
+def _has_tool_use(msg: dict) -> bool:
+    """True if this assistant message contains a tool_use block. My final
+    concluding message has none; 'let me do X:' narration messages precede a
+    command and do."""
+    return bool(_tool_uses(msg))
 
 
 def _is_real_user_message(msg: dict) -> bool:
@@ -121,10 +168,10 @@ def _last_user_and_tail_assistant(
     """Find the most recent real user message that carries a Telegram channel
     tag, and return it with all assistant messages that follow.
 
-    Self-triggered wakeups whose "user" prompt is synthetic and has no channel
-    tag would be missed if we anchored on the absolute last user message; if
-    we anchored on the latest channel-tagged message we'd orphan replies during
-    a race. So we walk back from the newest text-bearing assistant message."""
+    The assistant runs self-triggered wakeups whose "user" prompt is synthetic and has
+    no channel tag; if we anchored on the absolute last user message we'd miss
+    the live Telegram thread. Walking back to the most recent channel-tagged
+    message keeps replies flowing to the right chat."""
     # Race: a user can send a new telegram message before the PREVIOUS
     # assistant turn's Stop hook fires. If we anchored on "latest channel-
     # tagged user msg", we'd pick the new one and find zero assistant text
@@ -288,42 +335,58 @@ def main() -> int:
     if not transcript_path:
         return 0
 
-    # Stop hook can fire before the final text block is flushed to disk.
-    # Retry a few times, looking for a real text-bearing assistant message.
+    # Wait — event-driven, not polled — for the turn to CONCLUDE before we ship.
+    # Stop can fire a beat before the final assistant message hits disk; kqueue
+    # wakes us the instant it does, so there is no fixed delay. We ship the whole
+    # turn's user-facing text: the running "let me do X:" narration AND the final
+    # summary. The narration is intentional — it lets the user follow the thought
+    # process. The wait exists only to guarantee the concluding block has landed
+    # so the delivery isn't truncated mid-action (the 2026-07-04 "...force-delete
+    # safely:" failure, where the conclusion hadn't flushed yet). Timeout-bounded.
     import time as _t
     messages: list[dict] = []
     user_msg = None
     assistant_msgs: list[dict] = []
-    had_text = False
-    attempt = 0
-    for attempt in range(20):
+    deadline = None
+
+    def _concluded(tail: list[dict]) -> bool:
+        return bool(tail) and bool(_message_text(tail[-1]).strip()) and not _has_tool_use(tail[-1])
+
+    while True:
         messages = _read_transcript(Path(transcript_path))
         user_msg, assistant_msgs = _last_user_and_tail_assistant(messages)
-        if user_msg and assistant_msgs:
-            if any(_message_text(am).strip() for am in assistant_msgs):
-                had_text = True
-                break
-            # A turn that already replied via the tool will be skipped below;
-            # don't burn 10s waiting for text that doesn't matter.
-            if any(TELEGRAM_REPLY_TOOL in _tool_uses(am) for am in assistant_msgs):
-                break
-        # Only retry if there's an assistant turn in progress (tail exists but
-        # no text yet). If no assistant tail at all, waiting won't help.
+        # Stop waiting once the turn has concluded (final text block flushed),
+        # a reply tool was already called, or there is nothing to wait for.
+        if _concluded(assistant_msgs):
+            break
+        if assistant_msgs and any(TELEGRAM_REPLY_TOOL in _tool_uses(am) for am in assistant_msgs):
+            break
         if user_msg is None or not assistant_msgs:
             break
-        _t.sleep(0.5)
+        if deadline is None:
+            deadline = _t.monotonic() + _FLUSH_TIMEOUT
+        remaining = deadline - _t.monotonic()
+        if remaining <= 0:
+            break
+        # Blocks until the transcript is next written (or the bound elapses),
+        # then re-reads on the next iteration.
+        if not _wait_file_write(Path(transcript_path), remaining):
+            messages = _read_transcript(Path(transcript_path))
+            user_msg, assistant_msgs = _last_user_and_tail_assistant(messages)
+            break
 
     # Ledger first: record successful reply-tool sends no matter how this
     # invocation exits. The queue-sweeper acks inbound messages against these.
     _log_reply_tool_sends(messages)
 
     if user_msg is None or not assistant_msgs:
-        _log("skip", reason="no_anchor_or_tail", attempts=attempt + 1)
+        _log("skip", reason="no_anchor_or_tail")
         return 0
-    if not had_text and not any(
+    has_text = any(_message_text(am).strip() for am in assistant_msgs)
+    if not has_text and not any(
         TELEGRAM_REPLY_TOOL in _tool_uses(am) for am in assistant_msgs
     ):
-        _log("skip", reason="no_tail_text_after_retries", attempts=attempt + 1)
+        _log("skip", reason="no_tail_text")
         return 0
 
     inbound_text = _message_text(user_msg)
@@ -356,14 +419,10 @@ def main() -> int:
             return 0
         _log("fallback", reason="post_compaction_chat_id", chat_id=chat_id)
 
-    # Stop fires once at turn-end, not between tool calls. A turn can emit
-    # multiple text blocks interleaved with tool use (text → tool → text →
-    # tool → final_text); if we only shipped the last one, the user would see
-    # only the tail in Telegram while the full reasoning was visible in the
-    # terminal. Concatenate all text across tail assistant messages.
     # Skip only when a reply-tool call in this turn actually SUCCEEDED. A call
     # that errored (e.g. MCP died mid-turn) delivered nothing — in that case
-    # the hook must ship the turn's text itself or the user sees silence.
+    # the hook must ship the turn's concluding text itself or the user sees
+    # silence.
     successful = _successful_reply_tool_ids(messages)
     for am in assistant_msgs:
         content = (am.get("message") or {}).get("content")
@@ -378,6 +437,12 @@ def main() -> int:
             ):
                 _log("skip", reason="reply_tool_called", chat_id=chat_id)
                 return 0
+    # Ship the whole turn's user-facing text: every text block across the tail
+    # assistant messages, in order — the "let me do X:" narration AND the final
+    # summary. The user wants the narration; it's how they follow the thought process.
+    # The event-wait above guaranteed the concluding block has flushed, so this
+    # is the complete turn, not truncated mid-action. (Thinking blocks are still
+    # excluded by _message_text — that's private reasoning, not narration.)
     parts = [t for t in (_message_text(am).strip() for am in assistant_msgs) if t]
     if not parts:
         _log("skip", reason="no_text", chat_id=chat_id)
