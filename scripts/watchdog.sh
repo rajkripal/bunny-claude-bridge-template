@@ -4,7 +4,7 @@
 #
 # Config: customize BRIDGE_DIR / SESSION_NAME / add-dir paths below.
 # If .env exists at the repo root, it's sourced for BRIDGE_HOME, BRIDGE_LOG_DIR,
-# BRIDGE_SESSION_NAME, ASSISTANT_NAME, TELEGRAM_CHAT_ID.
+# BRIDGE_SESSION_NAME, ASSISTANT_NAME, TELEGRAM_CHAT_ID, CLAUDE_BIN.
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SELF_DIR/.." && pwd)"
@@ -16,6 +16,19 @@ SESSION_NAME="${BRIDGE_SESSION_NAME:-bridge}"
 ASSISTANT="${ASSISTANT_NAME:-Assistant}"
 SESSION_MODEL="${SESSION_MODEL:-claude-opus-4-7}"
 TELEGRAM_TOKEN=$(cat ~/.claude/channels/telegram/.env 2>/dev/null | grep TELEGRAM_BOT_TOKEN | cut -d= -f2)
+
+# Resolve claude to an absolute path. launchd runs with a minimal PATH, and the
+# auth-gate below must not mistake "binary not found" for "logged out". Set
+# CLAUDE_BIN in .env if your install lives somewhere else.
+resolve_claude_bin(){
+    if [ -n "${CLAUDE_BIN:-}" ]; then echo "$CLAUDE_BIN"; return; fi
+    local c
+    for c in "$(command -v claude 2>/dev/null)" "$HOME/.local/bin/claude" \
+             /opt/homebrew/bin/claude /usr/local/bin/claude; do
+        [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return; }
+    done
+    echo "/opt/homebrew/bin/claude"
+}
 
 mkdir -p "$LOG_DIR"
 
@@ -52,6 +65,30 @@ else
 fi
 
 if [ -z "$REASON" ]; then
+    exit 0
+fi
+
+# Claude Code's self-update briefly replaces the binary. Restarting in that window
+# would launch nothing (and the auth-gate below would be skipped), so wait it out.
+for _ in 1 2 3; do
+    CLAUDE=$(resolve_claude_bin)
+    [ -x "$CLAUDE" ] && break
+    sleep 10
+done
+if [ ! -x "$CLAUDE" ]; then
+    echo "[$(date)] Watchdog: claude binary missing after 30s, skipping restart this tick ($REASON)" >> "$LOG_DIR/watchdog.log"
+    exit 0
+fi
+
+# Auth-gate: a restart cannot fix expired Anthropic OAuth. Worse, restarting into
+# dead auth (a) masks the outage while logging "restarted successfully", and (b)
+# respawns the Telegram bridge, which re-grabs the single getUpdates reader slot
+# and fights the login-relay recovery for that slot. So when auth is dead, stand
+# down: let auth-monitor.sh + login-relay.sh own the reader slot and drive
+# recovery. Load launchd/com.bridge.auth-monitor.plist so a dead-auth outage
+# actually reaches you; without it this gate only logs.
+if ! "$CLAUDE" auth status 2>/dev/null | grep -q '"loggedIn": *true'; then
+    echo "[$(date)] Watchdog: auth is DEAD, standing down, NOT restarting ($REASON). Recovery owns the reader slot." >> "$LOG_DIR/watchdog.log"
     exit 0
 fi
 

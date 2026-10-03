@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Login relay. Runs scripts/login-relay.sh on demand only: auth-monitor.sh kicks
+  it with `launchctl kickstart` when you send /login during an auth outage.
+
+  Why it is its own job instead of a background child of auth-monitor:
+  auth-monitor is itself a launchd job, and when it exits (every 60s) launchd
+  tears down its whole process group. A `nohup ... &` child gets SIGKILLed before
+  it can mint a link or wait for your code. A separate job survives that.
+
+  So: no RunAtLoad, no StartInterval. Loading it just registers it.
+  Before loading: edit the /PATH/TO/... paths to absolutes. If you changed BRIDGE_LABEL_PREFIX in .env, change the Label
+  here to match (auth-monitor kicks "${BRIDGE_LABEL_PREFIX}.login-relay").
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.bridge.login-relay</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/PATH/TO/YOUR/BRIDGE/scripts/login-relay.sh</string>
+    </array>
+
+    <!-- Idle until auth-monitor kicks it. NOT RunAtLoad, no StartInterval. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/PATH/TO/YOUR/LOGS/login-relay-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/PATH/TO/YOUR/LOGS/login-relay-launchd-err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

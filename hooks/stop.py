@@ -162,58 +162,116 @@ def _is_real_user_message(msg: dict) -> bool:
     return False
 
 
-def _last_user_and_tail_assistant(
-    messages: list[dict],
-) -> tuple[dict | None, list[dict]]:
-    """Find the most recent real user message that carries a Telegram channel
-    tag, and return it with all assistant messages that follow.
-
-    The assistant runs self-triggered wakeups whose "user" prompt is synthetic and has
-    no channel tag; if we anchored on the absolute last user message we'd miss
-    the live Telegram thread. Walking back to the most recent channel-tagged
-    message keeps replies flowing to the right chat."""
-    # Race: a user can send a new telegram message before the PREVIOUS
-    # assistant turn's Stop hook fires. If we anchored on "latest channel-
-    # tagged user msg", we'd pick the new one and find zero assistant text
-    # after it — orphaning the reply to the earlier message.
-    #
-    # Correct anchor: the user message that preceded the latest text-bearing
-    # assistant message. That is, walk back from the end to find the newest
-    # assistant-with-text, then anchor on the nearest real user message
-    # before it. Prefer channel-tagged if available in that walk-back.
-    latest_text_assistant_idx = None
-    for i in range(len(messages) - 1, -1, -1):
-        if messages[i].get("type") == "assistant" and _message_text(messages[i]).strip():
-            latest_text_assistant_idx = i
-            break
-
-    anchor_idx = None
-    if latest_text_assistant_idx is not None:
-        for i in range(latest_text_assistant_idx - 1, -1, -1):
-            if _is_real_user_message(messages[i]):
-                anchor_idx = i
-                break
-
-    if anchor_idx is None:
-        # Fallback for post-compaction transcripts: the summary replaces the
-        # channel-tagged history. Anchor on the most recent real user message
-        # so we still pick up tail assistant text.
-        for i in range(len(messages) - 1, -1, -1):
-            if _is_real_user_message(messages[i]):
-                anchor_idx = i
-                break
-    if anchor_idx is None:
-        return None, []
-    # Cut off at the next real user message so we don't conflate replies to
-    # different inbound messages. The anchor's reply is everything between
-    # it and the next real user message (or end of transcript).
+def _tail_after(messages: list[dict], anchor_idx: int) -> list[dict]:
+    """Assistant messages between anchor_idx and the next real user message
+    (or end of transcript): the reply turn for the inbound at anchor_idx."""
     end_idx = len(messages)
     for i in range(anchor_idx + 1, len(messages)):
         if _is_real_user_message(messages[i]):
             end_idx = i
             break
-    tail = [m for m in messages[anchor_idx + 1 : end_idx] if m.get("type") == "assistant"]
-    return messages[anchor_idx], tail
+    return [m for m in messages[anchor_idx + 1 : end_idx] if m.get("type") == "assistant"]
+
+
+def _turn_already_delivered(
+    anchor_idx: int, tail: list[dict], messages: list[dict]
+) -> bool:
+    """True if the reply for the turn anchored at anchor_idx has already reached
+    Telegram: either via a CONFIRMED reply-tool send in its tail, or shipped by
+    a prior hook invocation (its exact text is in the delivery log). Used to tell
+    two look-alike races apart when the newest inbound has no response yet:
+
+    - Flush race: the prior turn is already delivered, so this Stop belongs to
+      the NEWER turn whose concluding text is still flushing to disk. Anchor the
+      newest inbound and let the wait loop block for its text. (This is the
+      2026-07-08 drop: a consensus answer was lost because the hook anchored on
+      the already-answered previous turn and self-satisfied on its reply.)
+    - Orphan: the prior turn was never delivered, so this Stop IS that turn and a
+      newer inbound merely landed first. Anchor the prior turn and ship it."""
+    successful = _successful_reply_tool_ids(messages)
+    for am in tail:
+        for block in (am.get("message") or {}).get("content") or []:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") == TELEGRAM_REPLY_TOOL
+                and block.get("id") in successful
+            ):
+                return True
+    parts = [t for t in (_message_text(am).strip() for am in tail) if t]
+    if parts:
+        chat_id, _ = _extract_channel_info(_message_text(messages[anchor_idx]))
+        if _text_already_in_delivery_log(chat_id, "\n\n".join(parts)):
+            return True
+    return False
+
+
+def _text_already_in_delivery_log(chat_id: str | None, buf: str) -> bool:
+    """Mirror of main()'s send dedupe: True if this exact (chat_id, text) was
+    already shipped per the delivery log. Lets a hook-delivered prior turn count
+    as delivered without re-shipping it."""
+    if not chat_id or not buf or not DELIVERY_LOG.exists():
+        return False
+    import hashlib
+    sig = hashlib.sha1(f"{chat_id}:{buf}".encode()).hexdigest()[:12]
+    try:
+        lines = DELIVERY_LOG.read_text().splitlines()
+    except Exception:
+        return False
+    for line in reversed(lines[-40:]):
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if rec.get("event") == "send_ok" and rec.get("sig") == sig:
+            return True
+    return False
+
+
+def _last_user_and_tail_assistant(
+    messages: list[dict],
+) -> tuple[dict | None, list[dict]]:
+    """Find the inbound this Stop is responding to and return it with the
+    assistant messages that follow (its reply turn).
+
+    Anchor on the NEWEST real user message by default: that is the inbound the
+    just-concluded turn answers. Two races complicate this:
+
+    - Flush race: when Stop fires, the newest inbound's concluding text may not
+      have hit disk yet. We must still anchor on that newest inbound (empty tail
+      and all) so the wait loop blocks for its text, NOT fall back to the prior,
+      already-answered turn. (Falling back was the 2026-07-08 silent drop.)
+    - Orphan race: a new inbound can land after the PREVIOUS turn concluded but
+      before that turn's Stop fires. Here the newest inbound has no response yet
+      AND the prior turn was never delivered, so this Stop is the prior turn.
+      Anchor it and ship it, or its reply is orphaned.
+
+    The disambiguator is _turn_already_delivered: only fall back to the prior
+    turn when it has NOT already been delivered."""
+    newest_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if _is_real_user_message(messages[i]):
+            newest_idx = i
+            break
+    if newest_idx is None:
+        return None, []
+
+    newest_tail = _tail_after(messages, newest_idx)
+    # Newest inbound already has a response with text: that's the current turn.
+    if any(_message_text(m).strip() for m in newest_tail):
+        return messages[newest_idx], newest_tail
+
+    # Newest inbound has no text yet. If the PRIOR turn concluded but was never
+    # delivered, this Stop is that orphaned turn: anchor and ship it. Otherwise
+    # the prior turn is already handled and this is a flush race for the newest
+    # turn: keep the newest anchor so the wait loop blocks for its text.
+    for i in range(newest_idx - 1, -1, -1):
+        if _is_real_user_message(messages[i]):
+            prior_tail = _tail_after(messages, i)
+            if prior_tail and not _turn_already_delivered(i, prior_tail, messages):
+                return messages[i], prior_tail
+            break
+    return messages[newest_idx], newest_tail
 
 
 def _last_known_chat_id() -> str | None:
@@ -252,13 +310,18 @@ _chunk_for_telegram = tg_ledger.chunk_for_telegram
 _send_message = tg_ledger.send_message
 
 
-def _successful_reply_tool_ids(messages: list[dict]) -> dict[str, dict]:
-    """Map tool_use_id -> {chat_id, sent_at_epoch} for reply-tool calls that
-    did not error. Only an explicit is_error tool_result counts as failure
-    (that's what an MCP death mid-turn produces — e.g. "No such tool
-    available"); a missing result is treated as sent, so a transcript flush
-    race can't cause a duplicate hook delivery."""
+def _reply_tool_result_ids(messages: list[dict]) -> tuple[set[str], set[str]]:
+    """Return (errored_ids, resulted_ids) for tool_use ids that have an
+    explicit tool_result somewhere in the transcript. `resulted_ids` covers
+    both success and error results. A tool_use id that is NOT in
+    `resulted_ids` at all has no result yet in the transcript we've
+    read: it may still be in flight (result not flushed to disk yet) or
+    it may be permanently gone (MCP died mid-call, never wrote a result).
+    Callers must not treat "not in resulted_ids" as success; see the
+    grace-period wait in main() that gives the in-flight case a chance to
+    resolve before it's treated as unresolved."""
     errored: set[str] = set()
+    resulted: set[str] = set()
     for msg in messages:
         if msg.get("type") != "user":
             continue
@@ -266,12 +329,23 @@ def _successful_reply_tool_ids(messages: list[dict]) -> dict[str, dict]:
         if not isinstance(content, list):
             continue
         for block in content:
-            if (
-                isinstance(block, dict)
-                and block.get("type") == "tool_result"
-                and block.get("is_error")
-            ):
-                errored.add(block.get("tool_use_id", ""))
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tid = block.get("tool_use_id", "")
+            resulted.add(tid)
+            if block.get("is_error"):
+                errored.add(tid)
+    return errored, resulted
+
+
+def _successful_reply_tool_ids(messages: list[dict]) -> dict[str, dict]:
+    """Map tool_use_id -> {chat_id, sent_at_epoch} for reply-tool calls that
+    have a CONFIRMED, non-error tool_result in the transcript. A tool_use
+    with no tool_result at all is NOT counted here: it's still unresolved
+    (see _reply_tool_result_ids); treating it as sent was the bug that let
+    a dead-mid-call MCP produce silent drops with no retry."""
+    errored, resulted = _reply_tool_result_ids(messages)
+    confirmed = resulted - errored
     sends: dict[str, dict] = {}
     for msg in messages:
         if msg.get("type") != "assistant":
@@ -285,7 +359,7 @@ def _successful_reply_tool_ids(messages: list[dict]) -> dict[str, dict]:
             if block.get("name") != TELEGRAM_REPLY_TOOL:
                 continue
             tid = block.get("id", "")
-            if tid in errored:
+            if tid not in confirmed:
                 continue
             chat_id = (block.get("input") or {}).get("chat_id")
             epoch = tg_ledger.iso_utc_to_epoch(msg.get("timestamp", "") or "")
@@ -299,6 +373,27 @@ def _successful_reply_tool_ids(messages: list[dict]) -> dict[str, dict]:
                 "sent_at_epoch": epoch,
             }
     return sends
+
+
+def _pending_reply_tool_ids(assistant_msgs: list[dict], messages: list[dict]) -> set[str]:
+    """Reply-tool tool_use ids called within `assistant_msgs` that have no
+    tool_result anywhere in `messages` yet: neither success nor error."""
+    _errored, resulted = _reply_tool_result_ids(messages)
+    pending: set[str] = set()
+    for am in assistant_msgs:
+        content = (am.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") == TELEGRAM_REPLY_TOOL
+            ):
+                tid = block.get("id", "")
+                if tid not in resulted:
+                    pending.add(tid)
+    return pending
 
 
 def _log_reply_tool_sends(messages: list[dict]) -> None:
@@ -359,10 +454,24 @@ def main() -> int:
         # a reply tool was already called, or there is nothing to wait for.
         if _concluded(assistant_msgs):
             break
-        if assistant_msgs and any(TELEGRAM_REPLY_TOOL in _tool_uses(am) for am in assistant_msgs):
+        # A reply-tool call alone is NOT enough to stop waiting: its
+        # tool_result may not have flushed to disk yet (the transcript-flush
+        # race this loop exists to dodge). Only stop early here once that
+        # tool_use's result: success or error, has actually landed; if it's
+        # still pending, keep waiting out the same bounded deadline used for
+        # the concluding-text wait below rather than assuming success.
+        if (
+            assistant_msgs
+            and any(TELEGRAM_REPLY_TOOL in _tool_uses(am) for am in assistant_msgs)
+            and not _pending_reply_tool_ids(assistant_msgs, messages)
+        ):
             break
-        if user_msg is None or not assistant_msgs:
+        if user_msg is None:
             break
+        # NOTE: an empty tail is NOT a reason to stop early. During a flush race
+        # the newest inbound's response hasn't landed yet; we anchor on it with
+        # an empty tail on purpose and must wait (bounded) for its text rather
+        # than exit and drop the reply. The deadline below bounds the wait.
         if deadline is None:
             deadline = _t.monotonic() + _FLUSH_TIMEOUT
         remaining = deadline - _t.monotonic()
@@ -420,10 +529,18 @@ def main() -> int:
         _log("fallback", reason="post_compaction_chat_id", chat_id=chat_id)
 
     # Skip only when a reply-tool call in this turn actually SUCCEEDED. A call
-    # that errored (e.g. MCP died mid-turn) delivered nothing — in that case
-    # the hook must ship the turn's concluding text itself or the user sees
-    # silence.
+    # that errored (e.g. MCP died mid-turn) delivered nothing, and a call
+    # whose result never showed up even after the wait loop's grace period
+    # (MCP subprocess died before writing ANY tool_result) is equally
+    # undelivered: in both cases the hook must ship the turn's concluding
+    # text itself or the user sees silence with no retry.
     successful = _successful_reply_tool_ids(messages)
+    still_pending = _pending_reply_tool_ids(assistant_msgs, messages)
+    if still_pending:
+        _log(
+            "reply_tool_unresolved", chat_id=chat_id,
+            tool_use_ids=sorted(still_pending),
+        )
     for am in assistant_msgs:
         content = (am.get("message") or {}).get("content")
         if not isinstance(content, list):

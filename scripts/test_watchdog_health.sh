@@ -14,12 +14,13 @@ PASS=0; FAIL=0
 WATCHDOG="$(cd "$(dirname "$0")" && pwd)/watchdog.sh"
 TMP=$(mktemp /tmp/watchdog-health-XXXX.sh)
 # Strip the original empty-REASON exit-0 block AND everything from the
-# restart echo onward — we want to reach our appended HEALTH_OK/FAIL logic
-# regardless of REASON state.
+# binary-wait / auth-gate onward. Those run the real `claude auth status` and
+# can exit 0 on their own, which would mask the health-check result we assert on.
 awk '
   /^if \[ -z "\$REASON" \]; then$/ {skip=1; next}
   skip && /^fi$/ {skip=0; next}
   skip {next}
+  /^# Claude Code.s self-update/ {exit}
   /^echo.*Watchdog: restarting/ {exit}
   {print}
 ' "$WATCHDOG" > "$TMP"
@@ -49,19 +50,22 @@ assert() {
 
 # Test 1: no tmux session at all → should report missing session.
 echo "case: no tmux session"
-SESSION_NAME=bunny-fake-nonexistent-$$ "$TMP" > /tmp/out.$$ 2>&1
+BRIDGE_SESSION_NAME=fake-nonexistent-$$ "$TMP" > /tmp/out.$$ 2>&1
 rc=$?
 assert "exit-nonzero" 1 "$rc"
 grep -q "tmux session missing" /tmp/out.$$ && assert "reason" 1 1 || assert "reason" 1 0
 
-# Test 2: live tmux session with a long-running sleep as the pane — claude
-# looks alive, MCP doesn't exist, grace period has NOT yet elapsed → should
-# still exit 0 (within grace period).
+# Test 2: live tmux session whose pane command carries "--name <session>" so
+# the watchdog's ps scan sees a claude-looking process. MCP doesn't exist,
+# grace period has NOT yet elapsed, so it should still exit 0.
+# watchdog.sh reads BRIDGE_SESSION_NAME (not SESSION_NAME), so set that.
 echo
-echo "case: claude up <90s, no MCP (grace period active)"
-tmux new-session -d -s watchdog-test-$$ 'sleep 600' 2>/dev/null || true
+echo "case: claude up <300s, no MCP (grace period active)"
+# The trailing no-op keeps the pane shell alive (a lone command gets exec'd,
+# which would drop "--name" from the visible argv).
+tmux new-session -d -s watchdog-test-$$ "sleep 600; : --name watchdog-test-$$" 2>/dev/null || true
 sleep 1
-SESSION_NAME=watchdog-test-$$ "$TMP" > /tmp/out.$$ 2>&1
+BRIDGE_SESSION_NAME=watchdog-test-$$ "$TMP" > /tmp/out.$$ 2>&1
 rc=$?
 assert "exit-zero-within-grace" 0 "$rc"
 grep -q "HEALTH_OK" /tmp/out.$$ && assert "reports-ok" 1 1 || assert "reports-ok" 1 0

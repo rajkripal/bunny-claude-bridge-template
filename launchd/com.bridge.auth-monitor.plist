@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Auth monitor. Runs scripts/auth-monitor.sh every 60s and at load: detects a
+  dead Anthropic OAuth session, alerts you once on Telegram, and kicks the
+  login-relay job when you send /login. Load it together with
+  com.bridge.login-relay.plist.
+  Before loading: edit the /PATH/TO/... paths to absolutes. If you changed
+  BRIDGE_LABEL_PREFIX in .env, change the Label here to match.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.bridge.auth-monitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/PATH/TO/YOUR/BRIDGE/scripts/auth-monitor.sh</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/PATH/TO/YOUR/LOGS/auth-monitor-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/PATH/TO/YOUR/LOGS/auth-monitor-launchd-err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

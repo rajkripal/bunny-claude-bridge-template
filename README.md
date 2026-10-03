@@ -16,6 +16,9 @@ identity and credentials, and you have the bones of a persistent AI assistant.
   text to Telegram so your replies never silently drop.
 - **Watchdog** — launchd-driven keepalive that restarts the `claude` tmux
   session if it dies or the Telegram MCP subprocess crashes.
+- **Auth recovery** (`scripts/auth-monitor.sh` + `scripts/login-relay.sh`):
+  notices when your Claude sign-in has died and lets you log back in from
+  your phone over Telegram. See [Auth recovery from your phone](#auth-recovery-from-your-phone).
 - **Job runner** — `scripts/run-job.sh` runs a prompt file through `claude -p`
   headless, logs the output, optionally pings you on Telegram.
 - **Launchd plist generator** — `scripts/generate-plists.sh` stamps out jobs.
@@ -80,6 +83,9 @@ identity and credentials, and you have the bones of a persistent AI assistant.
    launchctl load ~/Library/LaunchAgents/com.bridge.claude-bridge.plist
    ```
 
+   Also load the auth-recovery pair (recommended, see
+   [Auth recovery from your phone](#auth-recovery-from-your-phone)).
+
    Or on Linux: `crontab cron/crontab.txt`.
 
 7. **Start the session.** The watchdog will do this automatically once loaded,
@@ -91,6 +97,91 @@ identity and credentials, and you have the bones of a persistent AI assistant.
 8. **Pair your Telegram user.** DM your bot once, then run
    `/telegram:access` inside the tmux session to approve yourself.
 
+## Auth recovery from your phone
+
+### Why it exists
+
+The bridge runs on your Claude subscription through Claude Code's OAuth
+sign-in. That sign-in can expire or fail to refresh while every process stays
+alive. From the outside the bridge looks healthy: tmux is up, `claude` is
+running, the watchdog is happy. But nothing you send gets answered, and a
+restart can't fix it. Without something checking auth specifically, you only
+find out hours later.
+
+### How it works
+
+1. **Detect.** `scripts/auth-monitor.sh` runs every 60s and asks
+   `claude auth status` (no tokens spent, no API call). A single failure is
+   only logged, with some diagnostics. Two failures in a row count as an
+   outage, so a blip during a restart doesn't page you.
+2. **Alert once.** On a confirmed outage the monitor stops the bridge session
+   and sends you one Telegram message through the bot token and `curl`, which
+   needs no Anthropic auth. The watchdog stands down while auth is dead
+   instead of restarting into it. You get this alert once per outage.
+3. **Send `/login`.** Whenever you're ready, send `/login` (bare `login` also
+   works) to your bot. It must be the whole message, so "login later" or
+   "I can't login" never start a sign-in. Messages from any other chat are
+   ignored. The link isn't minted until you ask, so it can't expire while
+   you're away.
+4. **Open the link.** The monitor kicks `scripts/login-relay.sh`, which runs
+   `claude auth login --claudeai` on the host and sends you the sign-in link.
+   Open it on your phone and approve.
+5. **Paste the code back.** Claude shows you a code. Send just that code as
+   your next message to the bot. The relay feeds it to the waiting login
+   process and checks `claude auth status`. You have about 15 minutes.
+6. **Auto-restart.** On success the relay tells you so and drops the stale
+   session. The watchdog's auth check now passes, so it brings the bridge back
+   with `--continue` within a minute.
+
+Why the session gets stopped: a Telegram bot has exactly one `getUpdates`
+reader. Normally the Telegram plugin owns it. During an outage the plugin is
+useless anyway, so the monitor stops it and reuses that one reader to listen
+for `/login` and your code. No second bot is needed.
+
+### Setup (macOS)
+
+1. Make sure `.env` has `TELEGRAM_CHAT_ID` set and the bot token is in
+   `~/.claude/channels/telegram/.env` (both are part of the normal setup). If
+   `claude` isn't on launchd's PATH, set `CLAUDE_BIN` in `.env` to its absolute
+   path.
+2. Edit the `/PATH/TO/...` placeholders in
+   `launchd/com.bridge.auth-monitor.plist` and
+   `launchd/com.bridge.login-relay.plist`. If you changed
+   `BRIDGE_LABEL_PREFIX`, change both labels to match: the monitor kicks the
+   job named `${BRIDGE_LABEL_PREFIX}.login-relay`.
+3. Load both:
+   ```bash
+   for p in auth-monitor login-relay; do
+     cp launchd/com.bridge.$p.plist ~/Library/LaunchAgents/
+     launchctl load ~/Library/LaunchAgents/com.bridge.$p.plist
+   done
+   ```
+   The monitor runs every 60s. The relay has no schedule: loading it only
+   registers it so the monitor can start it on demand. It is a separate job on
+   purpose. A background child of the monitor would be killed by launchd the
+   moment the monitor's run ends.
+4. Optional: `bash scripts/test_auth_recovery.sh` runs the whole flow against
+   fakes (no real auth, tmux, launchd or Telegram).
+
+Logs: `auth-monitor.log` and `login-relay.log` in `BRIDGE_LOG_DIR`. If recovery
+fails, you can always run `claude auth login` on the host itself.
+
+### Security
+
+- **What crosses Telegram.** Bot chats are not end-to-end encrypted, so
+  assume Telegram can read them. What you send back is a single-use
+  authorization code that is only valid for a few minutes and is bound by
+  PKCE to the login process waiting on your machine. It is useless to anyone
+  without that process. Your access and refresh tokens are never sent over
+  Telegram; they stay on the host.
+- **Consent phishing.** Only approve a Claude sign-in link that you just
+  requested by sending `/login` to your own bot, and only send the resulting
+  code back to that same bot. Anyone can generate a Claude login link for
+  their own machine and send it to you. If you approve it and hand them the
+  code, they get a session on your account. An unexpected sign-in link is a
+  red flag, not a prompt. For the same reason the relay refuses to mint a
+  link when auth is already healthy.
+
 ## Directory layout
 
 ```
@@ -98,7 +189,7 @@ CLAUDE.md              Identity & instructions template (fill in)
 env.example            Env-var template — copy to .env
 .claude/settings.json  Hook registration
 hooks/                 Python hooks for Claude Code lifecycle
-scripts/               Watchdog, job runner, plist generator
+scripts/               Watchdog, auth monitor + login relay, job runner, plist generator
 cron/                  Telegram/Discord notify helpers + prompt library
   prompts/             Reusable prompts for scheduled jobs
 launchd/               plist templates (generated by scripts/generate-plists.sh)
@@ -114,6 +205,8 @@ launchd/               plist templates (generated by scripts/generate-plists.sh)
       your tools and accounts
 - [ ] `scripts/generate-plists.sh` — schedules and which jobs exist
 - [ ] `scripts/watchdog.sh` — the label, session name, restart message
+- [ ] `launchd/com.bridge.auth-monitor.plist` and `com.bridge.login-relay.plist`:
+      paths, and labels if you changed the prefix
 - [ ] Label prefix: the template uses `com.bridge.*` for launchd labels;
       change to your own prefix if you'd like
 

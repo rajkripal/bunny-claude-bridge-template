@@ -84,13 +84,21 @@ class StopHookTests(unittest.TestCase):
         self.assertEqual(sent[0]["text"], "here is my answer")
         self.assertEqual(sent[0]["reply_parameters"]["message_id"], 42)
 
+    def _reply_tool_result(self, tid: str = "t", *, is_error: bool = False) -> dict:
+        return {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tid, "is_error": is_error,
+             "content": "err" if is_error else "sent"},
+        ]}}
+
     def test_skips_when_reply_tool_already_called(self):
+        # Confirmed success: the tool_use's tool_result landed (non-error).
         code, _, sent = run_hook([
             _user(CHANNEL_MSG),
             _assistant([
                 _text("sending now"),
                 _tool_use("mcp__plugin_telegram_telegram__reply"),
             ]),
+            self._reply_tool_result("t"),
         ])
         self.assertEqual(code, 0)
         self.assertEqual(sent, [])
@@ -101,9 +109,27 @@ class StopHookTests(unittest.TestCase):
             _assistant([_tool_use("Bash")]),
             _assistant([_text("answer"),
                         _tool_use("mcp__plugin_telegram_telegram__reply")]),
+            self._reply_tool_result("t"),
         ])
         self.assertEqual(code, 0)
         self.assertEqual(sent, [])
+
+    def test_delivers_fallback_when_reply_tool_result_never_lands(self):
+        # The actual silent-drop bug: MCP subprocess dies mid-call and never
+        # writes ANY tool_result (not even an error one). After the bounded
+        # wait/grace period elapses with no result on disk, this must be
+        # treated as unresolved and the hook must deliver the fallback , 
+        # not silently skip on the assumption the tool succeeded.
+        code, _, sent = run_hook([
+            _user(CHANNEL_MSG),
+            _assistant([
+                _text("the actual answer"),
+                _tool_use("mcp__plugin_telegram_telegram__reply"),
+            ]),
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["text"], "the actual answer")
 
     def test_skips_non_telegram_inbound(self):
         code, _, sent = run_hook([
@@ -347,6 +373,143 @@ class LedgerAndOutboxTests(unittest.TestCase):
         self.assertEqual(entry["chat_id"], "123")
         self.assertEqual(entry["text"], "important answer")
         self.assertEqual(entry["reply_to"], "42")
+
+
+class AnchorRaceTests(unittest.TestCase):
+    """Regression tests for the 2026-07-08 flush-race silent drop and the
+    orphan race it must not reintroduce.
+
+    The bug: when the newest inbound's concluding text hasn't flushed at Stop
+    time, the hook anchored on the PREVIOUS (already-answered) turn, saw its
+    successful reply tool, and skipped: dropping the newest turn's answer.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.sink = self.root / "sends.jsonl"
+        self.log = self.root / "delivery.log"
+        self.env = {
+            **os.environ,
+            "STOP_HOOK_TEST_SINK": str(self.sink),
+            "STOP_HOOK_DELIVERY_LOG": str(self.log),
+            "TELEGRAM_BOT_TOKEN": "T",
+            "STOP_HOOK_FLUSH_TIMEOUT": "2.0",
+        }
+        self.env.pop("BUNNY_CRON_JOB", None)
+
+    def _write(self, transcript: list[dict]) -> Path:
+        p = self.root / "transcript.jsonl"
+        p.write_text(_jsonl(transcript))
+        return p
+
+    def _run(self, path: Path):
+        result = subprocess.run(
+            [sys.executable, str(HOOK)],
+            input=json.dumps({"transcript_path": str(path)}),
+            text=True, capture_output=True, timeout=20, env=self.env,
+        )
+        sent = []
+        if self.sink.exists():
+            sent = [json.loads(l) for l in self.sink.read_text().splitlines() if l.strip()]
+        skips = []
+        if self.log.exists():
+            skips = [json.loads(l) for l in self.log.read_text().splitlines()
+                     if l.strip() and json.loads(l).get("event") == "skip"]
+        return result.returncode, sent, skips
+
+    def _chan(self, mid: int) -> str:
+        return (f'<channel source="plugin:telegram:telegram" chat_id="123" '
+                f'message_id="{mid}">msg {mid}</channel>')
+
+    def _reply(self, tid: str) -> dict:
+        return {"type": "tool_use", "id": tid,
+                "input": {"chat_id": "123", "text": "prev"},
+                "name": "mcp__plugin_telegram_telegram__reply"}
+
+    def _result(self, tid: str, *, is_error: bool = False) -> dict:
+        return {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tid, "is_error": is_error,
+             "content": "err" if is_error else "sent"}]}}
+
+    def test_new_turn_delivered_when_prior_turn_replied_via_tool(self):
+        # The exact incident, static form: prior turn A answered via the reply
+        # tool; newest inbound B has its own text. B must be delivered and the
+        # hook must NOT skip on A's reply.
+        path = self._write([
+            _user(self._chan(1)),
+            _assistant([self._reply("tuA")]),
+            self._result("tuA"),
+            _assistant([_text("answer A")]),
+            _user(self._chan(2)),
+            _assistant([_text("answer B")]),
+        ])
+        code, sent, _ = self._run(path)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["text"], "answer B")
+        self.assertEqual(sent[0]["reply_parameters"]["message_id"], 2)
+
+    def test_flush_race_waits_for_late_text_then_delivers(self):
+        # The live race: at Stop time B's concluding text is NOT on disk yet
+        # (only an empty assistant block is). A background writer appends B's
+        # text mid-wait; the kqueue wait must wake and deliver it rather than
+        # anchoring on A and skipping.
+        path = self._write([
+            _user(self._chan(1)),
+            _assistant([self._reply("tuA")]),
+            self._result("tuA"),
+            _assistant([_text("answer A")]),
+            _user(self._chan(2)),
+            _assistant([]),  # empty assistant block flushed before the text
+        ])
+        import threading, time
+        late = _assistant([_text("late answer B")])
+
+        def append_later():
+            time.sleep(0.4)
+            with path.open("a") as f:
+                f.write("\n" + json.dumps(late))
+
+        t = threading.Thread(target=append_later)
+        t.start()
+        code, sent, skips = self._run(path)
+        t.join()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent), 1, f"expected 1 send, got {sent} (skips={skips})")
+        self.assertEqual(sent[0]["text"], "late answer B")
+
+    def test_orphan_prior_turn_shipped_when_newer_inbound_lands_first(self):
+        # Prior turn A concluded with text but was NEVER delivered (no reply
+        # tool, not in the log); a newer inbound B landed before A's Stop fired.
+        # This Stop is A's: A's text must ship, not be dropped for B.
+        path = self._write([
+            _user(self._chan(1)),
+            _assistant([_text("orphaned answer A")]),
+            _user(self._chan(2)),  # B arrived before A's Stop fired
+        ])
+        code, sent, _ = self._run(path)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["text"], "orphaned answer A")
+
+    def test_no_double_ship_when_prior_turn_already_hook_delivered(self):
+        # Prior turn A was already shipped by an earlier hook run (present in the
+        # delivery log). A newer inbound B has no response yet. This is a flush
+        # race, not an orphan: the hook must NOT re-ship A. With no text for B it
+        # simply waits out the bound and delivers nothing.
+        import hashlib
+        buf = "already shipped A"
+        sig = hashlib.sha1(f"123:{buf}".encode()).hexdigest()[:12]
+        self.log.write_text(json.dumps(
+            {"ts": "x", "event": "send_ok", "chat_id": "123", "sig": sig}) + "\n")
+        path = self._write([
+            _user(self._chan(1)),
+            _assistant([_text(buf)]),
+            _user(self._chan(2)),
+        ])
+        code, sent, _ = self._run(path)
+        self.assertEqual(code, 0)
+        self.assertEqual(sent, [])
 
 
 if __name__ == "__main__":
