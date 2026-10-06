@@ -411,12 +411,12 @@ def _log_reply_tool_sends(messages: list[dict]) -> None:
 
 
 def main() -> int:
-    # Cron jobs (run-job.sh) export BUNNY_CRON_JOB=1 before invoking
+    # Cron jobs (run-job.sh) export BRIDGE_CRON_JOB=1 before invoking
     # claude -p. Their prompts have no Telegram channel tag, so the
     # post-compaction fallback further down would otherwise treat the
     # cron's last-known chat_id as the destination and ship its output
     # to the user. Skip the hook entirely for cron contexts.
-    if os.environ.get("BUNNY_CRON_JOB"):
+    if os.environ.get("BRIDGE_CRON_JOB"):
         _log("skip", reason="cron_job_env")
         return 0
 
