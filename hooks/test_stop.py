@@ -267,7 +267,7 @@ class LedgerAndOutboxTests(unittest.TestCase):
             "STOP_HOOK_FLUSH_TIMEOUT": "0.3",
         }
         self.env.pop("STOP_HOOK_TEST_FAIL", None)
-        self.env.pop("BUNNY_CRON_JOB", None)
+        self.env.pop("BRIDGE_CRON_JOB", None)
 
     def run_hook_env(self, transcript: list[dict]) -> int:
         path = self.root / "transcript.jsonl"
@@ -395,7 +395,7 @@ class AnchorRaceTests(unittest.TestCase):
             "TELEGRAM_BOT_TOKEN": "T",
             "STOP_HOOK_FLUSH_TIMEOUT": "2.0",
         }
-        self.env.pop("BUNNY_CRON_JOB", None)
+        self.env.pop("BRIDGE_CRON_JOB", None)
 
     def _write(self, transcript: list[dict]) -> Path:
         p = self.root / "transcript.jsonl"
